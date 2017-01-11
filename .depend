@@ -1,0 +1,10 @@
+lib/bindings.cmi :
+lib/cident.cmi :
+lib/apply_bindings.cmo : lib/bindings.cmi
+lib/apply_bindings.cmx : lib/bindings.cmx
+lib/bindings.cmo : lib/bindings.cmi
+lib/bindings.cmx : lib/bindings.cmi
+lib/cident.cmo : lib/cident.cmi
+lib/cident.cmx : lib/cident.cmi
+stub_generator/generate.cmo : lib/bindings.cmi
+stub_generator/generate.cmx : lib/bindings.cmx

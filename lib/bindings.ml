@@ -8,237 +8,58 @@ module C = Ctypes
 
 include Self()
 
+module type Enumerable = sig
+  type t [@@deriving enumerate, compare, sexp]
+end
+
+
 let obj_addr x =
   Nativeint.shift_left (Nativeint.of_int (Obj.magic x)) 1
 
 let name = None
 
-module Make( Internal : Cstubs_inverted.INTERNAL) =
+module Make( Internal : sig
+    type ('a,'b) ctype
+
+    type enumerable
+    type abstract
+
+    type 'a enum = ('a,enumerable) ctype
+    type 'a opaque = ('a,abstract) ctype
+
+
+    module C = Ctypes
+
+    type cmodule
+
+
+    val cmodule : ?doc:string -> parent:cmodule -> string -> cmodule
+
+    val library : ?doc:string -> string -> cmodule
+
+    val enum : ?doc:string -> ?first:int ->
+      (module Enumerable with type t = 'a) -> cmodule -> 'a enum
+
+
+    val opaque : ?doc:string -> cmodule -> 'a opaque
+
+    val def : ?doc:string -> string -> ('a -> 'b) C.fn -> ('a -> 'b) -> unit
+
+    val (@~>) : ('a,_) ctype -> 'b C.fn -> ('a -> 'b) C.fn
+
+    val returns : ('a,_) ctype -> 'a C.fn
+    val partial : ('a,_) ctype -> 'a option C.fn
+    val mayfail : ('a,_) ctype -> 'a Or_error.t C.fn
+end) =
 struct
-  module Enum : sig
-    module type T = sig
-      type t [@@deriving enumerate, compare, sexp]
-    end
-    type 'a t
-    val define : ?first:int -> (module T with type t = 'a) -> string -> 'a t
-    val total : 'a t -> 'a C.typ
-    val partial : 'a t -> 'a option C.typ
+  open Internal
 
-  end = struct
-    module type T = sig
-      type t [@@deriving enumerate, compare, sexp]
-    end
-
-    type 'a t = {
-      total : 'a C.typ;
-      partial : 'a option C.typ;
-    }
-
-    let define ?(first=0) (type t) (module E: T with type t = t) name =
-      assert (first >= 0);
-      let enum = Array.of_list E.all in
-      Array.sort enum ~cmp:E.compare;
-      let read i = Array.get enum (i - first) in
-      let write t =
-        match
-          Array.binary_search ~compare:E.compare enum `First_equal_to t
-        with None -> assert false
-           | Some x -> x + first in
-      let read_opt i = if i = -1  then None else Some (read i) in
-      let write_opt = function
-        | None -> -1
-        | Some x -> write x in
-      let pref = String.uppercase ("bap_" ^ name) in
-      let view read write =
-        C.view ~format_typ:(fun k ppf -> fprintf ppf "enum %s_tag%t" name k)
-          ~read ~write C.int in
-      let cases = List.mapi E.all ~f:(fun i x ->
-          let name = String.uppercase (Sexp.to_string (E.sexp_of_t x)) in
-          pref ^ "_" ^ name, Int64.of_int (first + i)) in
-      let cases = (pref ^ "_INVALID", Int64.of_int (~-1)) :: cases in
-      let t = view read write in
-      let partial = view read_opt write_opt in
-      Internal.enum cases t;
-      Internal.typedef t (name ^ "_tag");
-      {total = t; partial}
-
-    let total t = t.total
-    let partial t = t.partial
-  end
-
-
-  let def name = Internal.internal ("bap_" ^ name)
-
-  module OString = struct
-    module Array = C.CArray
-    module Pool = Nativeint.Table
-
-    let managed = Pool.create ~size:1024 ()
-
-    let addr ptr =
-      C.to_voidp ptr |>
-      C.raw_address_of_ptr
-
-    let is_managed ptr = Hashtbl.mem managed (addr ptr)
-
-    let release ptr = Hashtbl.remove managed (addr ptr)
-
-    let str_of_ptr ptr = C.string_of (C.ptr C.void) (C.to_voidp ptr)
-
-    let expect_managed ptr =
-      invalid_argf "Object at %s is not managed by OCaml"
-        (str_of_ptr ptr) ()
-
-    let size ptr =
-      match Hashtbl.find managed (addr ptr) with
-      | None -> expect_managed ptr
-      | Some arr -> Array.length arr - 1
-
-    let read ptr =
-      match Hashtbl.find managed (addr ptr) with
-      | None -> expect_managed ptr
-      | Some arr ->
-        String.init (Array.length arr) ~f:(Array.get arr)
-
-    let write str =
-      let len = String.length str + 1 in
-      let arr = Array.make C.char len in
-      for i = 0 to len - 2 do
-        arr.(i) <- str.[i];
-      done;
-      arr.(len - 1) <- '\x00';
-      let kind = Bigarray.char in
-      let barr = C.bigarray_of_array C.array1 kind arr in
-      let ptr = C.bigarray_start C.array1 barr in
-      Hashtbl.set managed ~key:(addr ptr) ~data:arr;
-      ptr
-
-    let read_opt ptr =
-      if C.is_null ptr then None else Some (read ptr)
-    let write_opt = function
-      | None -> C.from_voidp C.char C.null
-      | Some str -> write str
-
-    let () = def "strlen" C.(ptr char @-> returning int) size
-
-    let t : string C.typ = C.view ~read ~write (C.ptr C.char)
-    let nullable : string option C.typ =
-      C.view (C.ptr C.char) ~read:read_opt ~write:write_opt
-
-    let spec = (t,nullable)
-  end
-
-  module Opaque : sig
-    type 'a t
-
-    val newtype : ?prefix:string -> ?suffix:string -> string -> 'a t
-    val view : 'a t -> read:('a -> 'b) -> write:('b -> 'a) -> 'b t
-    val total : 'a t -> 'a C.typ
-    val nullable : 'a t -> 'a option C.typ
-    val instanceof : base:'a t -> 'b t -> unit
-    val typename : 'a t -> string
-    val name : 'a t -> string
-  end = struct
-    open Ctypes
-
-    type 'a t = {
-      total  : 'a C.typ;
-      nullable  : 'a option C.typ;
-      instances : Int.Hash_set.t;
-      id : int;
-      base : string;
-      prefix : string;
-      suffix : string;
-    }
-
-    type 'a fat = {
-      typeid : int;
-      ovalue : 'a;
-    }
-
-    type typeinfo = {
-      name : string;
-    }
-
-    type opaque_t = Opaque
-
-    let registered = ref 0
-    let typeinfo = Int.Table.create ~size:1024 ()
-
-    let type_error name id =
-      let got = match Hashtbl.find typeinfo id with
-        | None -> "<unknown>"
-        | Some {name} -> name in
-      invalid_argf
-        "Type error: expected a value of type %s, but got %s"
-        name got ()
-
-    let nullpointer name =
-      invalid_argf
-        "Fatal error: an attempt to dereference a \
-         null pointer of type %s" name ()
-
-    let addr ptr = raw_address_of_ptr (to_voidp ptr)
-
-    type cstruct = opaque_t structure
-
-    let nullable t = t.nullable
-    let total t = t.total
-    let typename t = t.prefix ^ t.base ^ t.suffix
-    let name t = t.base
-
-    let newtype (type t) ?(prefix="bap_") ?(suffix="_t") base =
-      incr registered;
-      let name = prefix ^ base ^ suffix in
-      let t : cstruct typ = structure name in
-      let typeid = !registered in
-      let null = from_voidp t null in
-      Internal.typedef t name;
-      Hashtbl.set typeinfo ~key:typeid ~data:{name};
-      let instances = Int.Hash_set.create () in
-      let is_instance id =
-        id = typeid || Hash_set.mem instances id in
-      let read (opaque : cstruct ptr) : t =
-        if is_null opaque then nullpointer name;
-        let {typeid=id; ovalue} = Root.get (to_voidp opaque) in
-        if is_instance id then ovalue
-        else type_error name id in
-      let write (ovalue : t) : cstruct ptr =
-        from_voidp t (Root.create {typeid; ovalue}) in
-      let read_opt ptr = if is_null ptr then None else Some (read ptr) in
-      let write_opt = Option.value_map ~f:write ~default:null in
-      let view read write = view ~read ~write (ptr t) in
-      {
-        total = view read write;
-        nullable = view read_opt write_opt;
-        instances; id=typeid; base;
-        prefix; suffix;
-      }
-
-    let instanceof ~base t =
-      Hash_set.add base.instances t.id
-
-    let view t ~read ~write = {
-      t with
-      total = C.view t.total ~read ~write;
-      nullable = C.view t.nullable
-          ~read:(Option.map ~f:read)
-          ~write:(Option.map ~f:write);
-    }
-
-  end
-
-  type 'a opaque = 'a Opaque.t
-
-  let (!!) = Opaque.total
-  let (!?) = Opaque.nullable
-
-  type 'a ctype = 'a Ctypes.typ
+  let bap = library "bap"
 
   let release ptr =
     if not (C.is_null ptr) then
-      if OString.is_managed ptr
-      then OString.release ptr
+      if Cstring.is_managed ptr
+      then Ctring.release ptr
       else C.Root.release ptr
 
   let () =
@@ -264,7 +85,7 @@ struct
       | Error err -> set err; None
 
     let () =
-      def "error_get" C.(void @-> returning OString.t)
+      def "error_get" C.(void @-> returning Cstring.t)
         (fun () -> match current_error with
            | {contents=None} -> "unknown error (if any)"
            | {contents=Some err} -> Error.to_string_hum err);
@@ -272,7 +93,7 @@ struct
   end
 
   let () =
-    def "version" C.(void @-> returning OString.t) version;
+    def "version" C.(void @-> returning Cstring.t) version;
     def "_standalone_init" C.(int @-> ptr string @-> returning int)
       standalone_init
 
@@ -290,35 +111,35 @@ struct
         (type t) (type elt)
         (module Seq : Container.S0 with type t = t and type elt = elt)
         seq elt =
-      let visitor = C.(fn (!!elt @-> ptr void @-> returning void)) in
-      let predicate = C.(fn (!!elt @-> ptr void @-> returning bool)) in
-      let name = Opaque.name seq in
-      let def fn = def (name ^ "_" ^ fn) in
-      Internal.typedef visitor (name ^ "_visitor_t");
-      Internal.typedef predicate (name ^ "_predicate_t");
+      let visitor = C.(fn (elt @~> ptr void @-> returning void)) in
+      let predicate = C.(fn (elt @-> ptr void @-> returning bool)) in
       def "iter"
-        C.(!!seq @-> visitor @-> ptr void @-> returning void)
+        C.(seq @~> visitor @-> ptr void @-> returning void)
         (apply Seq.iter);
       def "find"
-        C.(!!seq @-> predicate @-> ptr void @-> returning !?elt)
+        C.(seq @~> predicate @-> ptr void @-> partial elt)
         (apply Seq.find);
       def "exists"
-        C.(!!seq @-> predicate @-> ptr void @-> returning bool)
+        C.(seq @~> predicate @-> ptr void @-> returning bool)
         (apply Seq.exists);
       def "forall"
-        C.(!!seq @-> predicate @-> ptr void @-> returning bool)
+        C.(seq @~> predicate @-> ptr void @-> returning bool)
         (apply Seq.for_all);
       def "count"
-        C.(!!seq @-> predicate @-> ptr void @-> returning int)
+        C.(seq @~> predicate @-> ptr void @-> returning int)
         (apply Seq.count);
-      def "mem" C.(!!seq @-> !!elt @-> returning bool) Seq.mem;
+      def "mem" C.(seq @~> elt @~> returning bool) Seq.mem;
       ()
-
-
   end
+
 
   module Seq = struct
     module ML = Seq
+    let seq = cmodule ~parent:bap "seq"
+
+    type poly = Poly
+    let t : poly seq opaque = opaque seq
+
     module Iter = struct
       type 'a t = {
         seq : 'a seq;
@@ -336,28 +157,25 @@ struct
         res
     end
 
-    type poly = Poly
-
-    let t : poly seq opaque = Opaque.newtype "seq"
 
     let () =
-      let def fn = def ("seq_" ^ fn) in
-      def "is_empty" C.(!!t @-> returning bool) Seq.is_empty;
-      def "length" C.(!!t @-> returning int) Seq.length;
-      def "append" C.(!!t @-> !!t @-> returning !!t) Seq.append;
-      def "sub" C.(!!t @-> int @-> int @-> returning !!t)
+      def "is_empty" C.(t @~> returning bool) Seq.is_empty;
+      def "length" C.(t @~> returning int) Seq.length;
+      def "append" C.(t @~> t @~> returns t) Seq.append;
+      def "sub" C.(t @~> int @-> int @-> returns t)
         (fun t pos len -> Seq.sub t ~pos ~len);
-      def "take" C.(!!t @-> int @-> returning !!t) Seq.take;
-      def "drop" C.(!!t @-> int @-> returning !!t) Seq.drop;
+      def "take" C.(t @~> int @-> returns t) Seq.take;
+      def "drop" C.(t @~> int @-> returns t) Seq.drop;
       ()
 
-    let iterator name seq iter elt =
-      let def fn = def (name ^ "_seq_iterator_" ^ fn) in
-      def "create" C.(!!seq @-> returning !!iter) Iter.create;
-      def "next" C.(!!iter @-> returning !?elt) Iter.next;
-      def "value" C.(!!iter @-> returning !?elt) Iter.value;
-      def "has_next" C.(!!iter @-> returning bool) Iter.has_next;
-      def "reset" C.(!!iter @-> returning void) Iter.reset
+    let iterator seq elt =
+      let iter = cmodule ~parent:(Ctype.cmodule seq) "iterator" in
+      let t = opaque iter in
+      def "create" C.(seq @~> returns t) Iter.create;
+      def "next" C.(t @~> partial elt) Iter.next;
+      def "value" C.(t @~> partial elt) Iter.value;
+      def "has_next" C.(t @~> returning bool) Iter.has_next;
+      def "reset" C.(t @~> returning void) Iter.reset
 
     let instance (type t) (module T : T with type t = t) elt =
       let module Seq0 = struct
@@ -365,8 +183,8 @@ struct
         type t = elt seq
         include (Seq : Container.S1 with type 'a t := 'a seq)
       end in
-      let name = Opaque.name elt in
-      let seq : t seq opaque = Opaque.newtype (name ^ "_seq") in
+      let seq = cmodule ~parent:(Ctype.cmodule elt) "seq" in
+      let seq_t : t seq opaque =  in
       let iter :  t Iter.t opaque = Opaque.newtype (name ^ "_seq_iterator") in
       let def fn = def (name ^ "_seq_" ^ fn) in
       let mapper = fn C.(!!elt @-> ptr void @-> returning !!elt) in
@@ -429,7 +247,7 @@ struct
       let name = Opaque.name t in
       let def fn = def (name ^ "_" ^ fn) in
       let t = Opaque.total t in
-      def "to_string" C.(t @-> returning OString.t) T.to_string;
+      def "to_string" C.(t @-> returning Cstring.t) T.to_string;
       def "compare" C.(t @-> t @-> returning int) T.compare;
       def "equal"   C.(t @-> t @-> returning bool) T.equal;
       def "hash"    C.(t @-> returning int) T.hash
@@ -476,8 +294,8 @@ struct
         module T = Value
       end)
 
-    let () = 
-      def "tagname" C.(!!t @-> returning OString.t) Value.tagname
+    let () =
+      def "tagname" C.(!!t @-> returning Cstring.t) Value.tagname
 
 
     module Dict = struct
@@ -513,7 +331,7 @@ struct
       ] [@@deriving enumerate, compare, sexp]
     end
 
-    let t : color Enum.t = Enum.define (module T) "color"
+    let t : color ctype = enum (module T) "color"
 
   end
 
@@ -524,9 +342,7 @@ struct
         | BigEndian
       [@@deriving compare, enumerate, sexp]
     end
-    let enum = Enum.define (module T) "endian"
-    let t = Enum.total enum
-    let partial = Enum.partial enum
+    let t = enum (module T) "endian"
   end
 
   (* small positive int *)
@@ -605,7 +421,7 @@ struct
 
 
   module Arch = struct
-    let t = Enum.define (module Arch) "bap_arch"
+    let t = enum (module Arch) "bap_arch"
     let total = Enum.total t
     let partial = Enum.partial t
 
@@ -615,7 +431,7 @@ struct
       let def fn = def ("arch_" ^ fn) in
       def "endian" C.(total @-> returning Endian.t) Arch.endian;
       def "addr_size" C.(total @-> returning Size.t) size ;
-      def "to_string" C.(total @-> returning OString.t) Arch.to_string ;
+      def "to_string" C.(total @-> returning Cstring.t) Arch.to_string ;
       def "of_string" C.(string @-> returning partial) Arch.of_string;
   end
 
@@ -673,7 +489,7 @@ struct
       end)
 
     let () =
-      def "name" C.(!!t @-> returning OString.t) Var.name;
+      def "name" C.(!!t @-> returning Cstring.t) Var.name;
       def "type" C.(!!t @-> returning !!Type.t) Var.typ;
       def "is_physical" C.(!!t @-> returning bool) Var.is_physical;
       def "is_virtual" C.(!!t @-> returning bool) Var.is_virtual;
@@ -880,7 +696,7 @@ struct
       def "create_load"
         C.(!!t @-> !!t @-> Endian.t @-> Size.t @-> returning !!t)
         create_load;
-      def "unknown_msg" C.(!!t @-> returning OString.t) unknown_msg;
+      def "unknown_msg" C.(!!t @-> returning Cstring.t) unknown_msg;
       def "unknown_typ" C.(!!t @-> returning !?Type.t) unknown_type;
       def "create_store"
         C.(!!t @-> !!t @-> !!t @-> Endian.t @-> Size.t @-> returning !!t)
@@ -990,7 +806,7 @@ struct
       Regular.instance (module Tid) t;
       def "create" C.(void @-> returning !!t) Tid.create;
       def "set_name" C.(!!t @-> string @-> returning void) Tid.set_name;
-      def "name" C.(!!t @-> returning OString.t) Tid.name;
+      def "name" C.(!!t @-> returning Cstring.t) Tid.name;
       def "from_string" C.(string @-> returning !?t)
         (Error.lift1 Tid.from_string)
   end
@@ -1059,8 +875,8 @@ struct
     end
 
     let () =
-      let def fn = def ("term_" ^ fn) in 
-      def "name" C.(!!t @-> returning OString.t) Term.name;
+      let def fn = def ("term_" ^ fn) in
+      def "name" C.(!!t @-> returning Cstring.t) Term.name;
       def "clone" C.(!!t @-> returning !!t) Term.clone;
       def "tid" C.(!!t @-> returning !!Tid.t) Term.tid;
       def "same" C.(!!t @-> !!t @-> returning bool) Term.same;
@@ -1190,7 +1006,7 @@ struct
       Term.parentof ~child:Blk.t blk_t t;
       def "lift"
         C.(!!Block.t @-> !!Cfg.t @-> returning !!t) Sub.lift;
-      def "name" C.(!!t @-> returning OString.t) Sub.name;
+      def "name" C.(!!t @-> returning Cstring.t) Sub.name;
       def "with_name" C.(!!t @-> string @-> returning !!t)
         Sub.with_name;
       def "ssa" C.(!!t @-> returning !!t) Sub.ssa;
@@ -1268,11 +1084,11 @@ struct
     let () = C.seal params
     let () = Internal.structure params
 
-    module Attr = struct 
-      type t = project 
+    module Attr = struct
+      type t = project
       let t = t
       let get t = Fn.flip Project.get t
-      let set t = Fn.flip Project.set t 
+      let set t = Fn.flip Project.set t
       let has t = Fn.flip Project.has t
       let rem tag t = failwith "not implemented"
     end
@@ -1314,7 +1130,7 @@ struct
   module Attributes = struct
     module type Dict = sig
       type t
-      val t   : t opaque 
+      val t   : t opaque
       val get : 'a Value.ML.tag -> t -> 'a option
       val set : 'a Value.ML.tag -> t -> 'a -> t
       val has : 'a Value.ML.tag -> t -> bool
@@ -1322,7 +1138,7 @@ struct
     end
 
     let register_dict_ops (type t)
-        (module Dict : Dict) ns a a_opt tag = 
+        (module Dict : Dict) ns a a_opt tag =
       let def fn = def (ns fn) in
       def "get" C.(!!Dict.t @-> returning a_opt) (Dict.get tag);
       def "set" C.(!!Dict.t @-> a @-> returning !!Dict.t) (Dict.set tag);
@@ -1337,14 +1153,14 @@ struct
           else Dict.rem tag dict);
       def "has" C.(!!Dict.t @-> returning bool) (Dict.has tag)
 
-    module NS = struct 
-      let term name fn = "term_" ^ fn ^ "_" ^ name 
+    module NS = struct
+      let term name fn = "term_" ^ fn ^ "_" ^ name
       let dict name fn = "value_dict_" ^ fn ^ "_" ^ name
-      let proj name fn = "project_" ^ fn ^ "_" ^ name 
+      let proj name fn = "project_" ^ fn ^ "_" ^ name
     end
 
-    let tagname tag = 
-      Value.ML.Tag.name tag |> 
+    let tagname tag =
+      Value.ML.Tag.name tag |>
       Stringext.replace_all ~pattern:"-" ~with_:"_"
 
     let register (type a)
@@ -1367,7 +1183,7 @@ struct
       let def fn = def (fn ^ "_" ^ name) in
       def "create" C.(void @-> returning !!Value.t) (Value.ML.create tag);
       def "is" C.(!!Value.t @-> returning bool) (Value.ML.is tag);
-      let dict m ns = 
+      let dict m ns =
         register_void_dict_ops m (ns name) tag in
       dict (module Value.Dict) NS.dict;
       dict (module Term.Attr) NS.term;
@@ -1380,7 +1196,7 @@ struct
       register tag ~nullable:Enum.partial ~total:Enum.total
 
     let register_string_tag tag =
-      register tag ~nullable:snd ~total:fst OString.(t,nullable)
+      register tag ~nullable:snd ~total:fst Cstring.(t,nullable)
 
     (* treat the weight tag specialy, do not generalize
        this function to all floats *)
